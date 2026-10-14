@@ -9,7 +9,7 @@
 //   --console        attach to the launching console and log there (debugging)
 //   --hint <text> | --width W --height H     which output to capture (default: hint DELD0E6, auto size)
 //   --listen <port> | --connect host:port | --udp <port> | --usb | --no-usb | --no-net
-//   --fps N  --bitrate <Mbps>  --gop N  --vbv-ms N  --min-qp N  --max-qp N  --no-cfr  --no-touch
+//   --fps N  --idle-fps N (floor rate when the desktop is static, default 30, 0 = same as --fps)  --bitrate <Mbps>  --gop N  --vbv-ms N  --min-qp N  --max-qp N  --no-cfr  --no-touch
 //   --out <file>     also record the H.264 stream;  --seconds N  stop after N seconds (test runs)
 //
 // Logs: %LOCALAPPDATA%\ScreenExt\HostService.log.   Must run in the interactive user session.
@@ -191,6 +191,7 @@ static int HostMain(int argc, wchar_t** argv)
     CaptureConfig capCfg;
     EncoderConfig encCfg;
     double seconds = 10.0;
+    UINT idleFps = 30;   // floor frame rate while the desktop is static; 0 = same as --fps
     bool cfr = true;
     std::wstring outPath;
     TransportConfig netCfg;
@@ -236,6 +237,7 @@ static int HostMain(int argc, wchar_t** argv)
         else if (!wcscmp(argv[i], L"--no-usb"))                  netCfg.enableUsb = false;
         else if (!wcscmp(argv[i], L"--no-net"))                  useNet = false;
         else if (!wcscmp(argv[i], L"--discovery-port") && i + 1 < argc) netCfg.discoveryPort = (uint16_t)_wtoi(argv[++i]);
+        else if (!wcscmp(argv[i], L"--idle-fps") && i + 1 < argc) idleFps = (UINT)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--no-cfr"))                  cfr = false;
         else if (!wcscmp(argv[i], L"--no-touch"))                noTouch = true;   // log touches only
     }
@@ -325,17 +327,17 @@ static int HostMain(int argc, wchar_t** argv)
     }
 
     const double frameInterval = 1.0 / encCfg.fps;
+    // While the desktop is unchanged we keep re-submitting the last frame at a steady floor rate (default 30 fps,
+    // never above --fps) so the stream stays live and ramps up instantly when something moves. These repeats are
+    // cheap, and the credit check below means they can never pile up behind a slow encoder.
+    const UINT    idleRate = std::max<UINT>(1, std::min<UINT>(idleFps ? idleFps : encCfg.fps, encCfg.fps));
+    const double idleInterval = 1.0 / idleRate;
     const UINT acquireTimeoutMs = cfr ? 4 : 100;
 
     const double start = QpcNow();
     double lastReport = start, lastSubmit = 0;
     bool haveFrame = false;
     bool dirty = false;           // a captured frame hasn't been submitted yet
-    // After the desktop stops changing, only a few "settle" repeats are encoded (they let the encoder
-    // refine the picture), then a slow heartbeat. 2473 repeats in a 96 s test were pure waste.
-    const int    settleRepeats = 8;
-    const double heartbeatSec = 0.5;
-    int          repeatsSinceCapture = 0;
     uint64_t     noCreditSkips = 0, winNoCredit = 0;
     uint64_t captured = 0, repeats = 0, submitErrors = 0, consecutiveErrors = 0;
     uint64_t winCaptured = 0, winSubmitted = 0, winDropped = 0;
@@ -349,7 +351,7 @@ static int HostMain(int argc, wchar_t** argv)
 
         switch (st) {
         case FrameStatus::Ok:
-            ++captured; ++winCaptured; haveFrame = true; dirty = true; repeatsSinceCapture = 0;
+            ++captured; ++winCaptured; haveFrame = true; dirty = true;
             if (!cfr) submitNow = true;
             break;
 
@@ -401,7 +403,7 @@ static int HostMain(int argc, wchar_t** argv)
         // last frame if nothing changed for a full interval.
         if (cfr && haveFrame && !g_stop) {
             const double since = QpcNow() - lastSubmit;
-            const double repeatInterval = (repeatsSinceCapture < settleRepeats) ? frameInterval : heartbeatSec;
+            const double repeatInterval = idleInterval;
             const bool due = dirty ? (since >= frameInterval * 0.85) : (since >= repeatInterval);
             if (due) {
                 // Never queue behind the encoder: submit only when the MFT has asked for input. A slow encoder
@@ -417,7 +419,7 @@ static int HostMain(int argc, wchar_t** argv)
             const SubmitResult r = encoder.Submit(engine.PaddedTexture());
             lastSubmit = QpcNow();
             dirty = false;
-            if (isRepeat) { ++repeats; ++repeatsSinceCapture; }
+            if (isRepeat) ++repeats;
             if (r == SubmitResult::Error) {
                 ++submitErrors;
                 if (++consecutiveErrors >= 30) { Logf(L"[main] Too many encoder errors; stopping.\n"); g_stop = 1; }
@@ -663,7 +665,14 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             InterlockedExchange(&g_stop, 1);      // the worker notices, drains the encoder, closes sockets
             DestroyWindow(hwnd);
         } else if (LOWORD(wp) == IDM_OPENLOG && !g_logFilePath.empty()) {
-            const std::wstring arg = L"\"" + g_logFilePath + L"\"";
+            // Open a snapshot copy so the viewer never holds the live log (which also keeps rotation working).
+            wchar_t tmp[MAX_PATH] = {};
+            std::wstring target = g_logFilePath;
+            if (GetTempPathW(MAX_PATH, tmp) > 0) {
+                const std::wstring snap = std::wstring(tmp) + L"ScreenExt-HostService-log.txt";
+                if (CopyFileW(g_logFilePath.c_str(), snap.c_str(), FALSE)) target = snap;
+            }
+            const std::wstring arg = L"\"" + target + L"\"";
             ShellExecuteW(nullptr, L"open", L"notepad.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
         }
         return 0;

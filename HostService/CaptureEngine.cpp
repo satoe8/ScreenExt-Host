@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cwctype>
+#include <share.h>
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
@@ -31,7 +32,10 @@ void OpenLogLocked()
 {
     g_logFile = nullptr;
     if (g_logPath.empty()) return;
-    _wfopen_s(&g_logFile, g_logPath.c_str(), L"a, ccs=UTF-8");
+    // _SH_DENYNO: let other programs (Notepad, tail, antivirus) read - and write - the file while we keep it
+    // open. fopen_s/_wfopen_s would use _SH_DENYWR, which makes a second program's open fail with
+    // "The process cannot access the file because it is being used by another process".
+    g_logFile = _wfsopen(g_logPath.c_str(), L"a, ccs=UTF-8", _SH_DENYNO);
     g_logBytes = 0;
     if (g_logFile) {
         fseek(g_logFile, 0, SEEK_END);
@@ -70,8 +74,9 @@ void Logf(const wchar_t* fmt, ...)
             if (g_logBytes > kMaxLogBytes) {            // simple rotation: keep one old file
                 fclose(g_logFile);
                 g_logFile = nullptr;
-                MoveFileExW(g_logPath.c_str(), (g_logPath + L".old").c_str(), MOVEFILE_REPLACE_EXISTING);
+                const BOOL moved = MoveFileExW(g_logPath.c_str(), (g_logPath + L".old").c_str(), MOVEFILE_REPLACE_EXISTING);
                 OpenLogLocked();
+                if (!moved) g_logBytes = 0;   // file is held by a viewer: try again after another 8 MB, not every line
             }
         }
     }
