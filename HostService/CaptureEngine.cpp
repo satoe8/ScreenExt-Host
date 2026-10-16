@@ -271,9 +271,12 @@ bool CaptureEngine::CreateDevice(IDXGIAdapter1* adapter)
     }
 
     // The encoder will touch this device from another thread; make the immediate context safe.
-    ComPtr<ID3D11Multithread> mt;
-    if (SUCCEEDED(ctx_.As(&mt)))
-        mt->SetMultithreadProtected(TRUE);
+    mt_.Reset();
+    if (SUCCEEDED(ctx_.As(&mt_)))
+        mt_->SetMultithreadProtected(TRUE);
+
+    if (cfg_.drawCursor && !cursor_.Initialize(device_.Get(), ctx_.Get()))
+        Logf(L"[capture] Cursor overlay unavailable; the mouse pointer will not be drawn\n");
 
     Logf(L"[capture] D3D11 device created (feature level 0x%X)\n", (unsigned)got);
     return true;
@@ -289,29 +292,37 @@ bool CaptureEngine::CreatePaddedTexture()
     d.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
     d.SampleDesc.Count = 1;
     d.Usage            = D3D11_USAGE_DEFAULT;
-    // RENDER_TARGET is needed for the one-time clear below; SHADER_RESOURCE keeps options open
-    // (e.g. an RGB->NV12 pass) if we don't hand the ARGB surface to NVENC directly.
-    // We'll confirm the exact bind flags NVENC wants when we register the resource.
+    // RENDER_TARGET: one-time clear (and, for padded_, the pointer is drawn into it); SHADER_RESOURCE keeps options
+    // open (e.g. an RGB->NV12 pass).
     d.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
-    HRESULT hr = device_->CreateTexture2D(&d, nullptr, padded_.ReleaseAndGetAddressOf());
+    // desktop_ holds the clean desktop; padded_ = desktop_ + mouse pointer. Keeping them separate means a moving
+    // pointer never leaves a trail (we can always redraw from the clean copy).
+    HRESULT hr = device_->CreateTexture2D(&d, nullptr, desktop_.ReleaseAndGetAddressOf());
+    if (SUCCEEDED(hr))
+        hr = device_->CreateTexture2D(&d, nullptr, padded_.ReleaseAndGetAddressOf());
     if (FAILED(hr)) {
         Logf(L"[capture] CreateTexture2D(%ux%u) failed: 0x%08X %ls\n", d.Width, d.Height, (unsigned)hr, HrName(hr));
         return false;
     }
 
-    // Clear once to opaque black. Row [height] is never written by the per-frame copy
+    // Clear both once to opaque black. The padding row/column is never written by the per-frame copy
     // (unless replicateLastRow is set), so it stays black.
-    ComPtr<ID3D11RenderTargetView> rtv;
-    hr = device_->CreateRenderTargetView(padded_.Get(), nullptr, &rtv);
+    ComPtr<ID3D11RenderTargetView> desktopRtv;
+    paddedRtv_.Reset();
+    hr = device_->CreateRenderTargetView(desktop_.Get(), nullptr, &desktopRtv);
+    if (SUCCEEDED(hr))
+        hr = device_->CreateRenderTargetView(padded_.Get(), nullptr, &paddedRtv_);
     if (FAILED(hr)) {
         Logf(L"[capture] CreateRenderTargetView failed: 0x%08X\n", (unsigned)hr);
         return false;
     }
     const float black[4] = { 0.f, 0.f, 0.f, 1.f };
-    ctx_->ClearRenderTargetView(rtv.Get(), black);
+    ctx_->ClearRenderTargetView(desktopRtv.Get(), black);
+    ctx_->ClearRenderTargetView(paddedRtv_.Get(), black);
 
-    Logf(L"[capture] Padded texture %ux%u B8G8R8A8_UNORM allocated\n", d.Width, d.Height);
+    composeDirty_ = true;
+    Logf(L"[capture] Textures %ux%u B8G8R8A8_UNORM allocated\n", d.Width, d.Height);
     return true;
 }
 
@@ -384,11 +395,42 @@ bool CaptureEngine::Initialize(const CaptureConfig& cfg)
     return Recover();
 }
 
+// Called when AcquireNextFrame timed out: the desktop is static, but the mouse may still have moved.
+bool CaptureEngine::PollPointerOnly(CapturedFrame& out)
+{
+    if (!cfg_.drawCursor || !device_ || !padded_) return false;
+    if (!cursor_.Poll(OutputDeviceName(), cfg_.width, cfg_.height)) return false;
+    composeDirty_   = true;
+    out.texture     = padded_.Get();
+    out.frameIndex  = ++frameIndex_;
+    out.pointerOnly = true;
+    return true;
+}
+
+ID3D11Texture2D* CaptureEngine::FrameForEncode()
+{
+    if (!padded_ || !desktop_ || !ctx_) return nullptr;
+    if (composeDirty_) {
+        // Atomic with respect to other threads using the immediate context (the media encoder).
+        if (mt_) mt_->Enter();
+        ctx_->CopyResource(padded_.Get(), desktop_.Get());
+        if (cfg_.drawCursor && cursor_.Visible())
+            cursor_.Draw(paddedRtv_.Get(), paddedW_, paddedH_);
+        if (mt_) mt_->Leave();
+        composeDirty_ = false;
+    }
+    return padded_.Get();
+}
+
 void CaptureEngine::Shutdown()
 {
     dupl_.Reset();
     output_.Reset();
+    paddedRtv_.Reset();
     padded_.Reset();
+    desktop_.Reset();
+    cursor_.Reset();
+    mt_.Reset();
     if (ctx_)
         ctx_->ClearState();
     ctx_.Reset();
@@ -460,8 +502,8 @@ FrameStatus CaptureEngine::AcquireNextFrame(UINT timeoutMs, CapturedFrame& out)
     ComPtr<IDXGIResource> resource;
     HRESULT hr = dupl_->AcquireNextFrame(timeoutMs, &info, resource.ReleaseAndGetAddressOf());
 
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT)
-        return FrameStatus::Timeout;   // normal when the desktop is static; nothing to release
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT)   // normal when the desktop is static; nothing to release
+        return PollPointerOnly(out) ? FrameStatus::Ok : FrameStatus::Timeout;
 
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         Logf(L"[capture] AcquireNextFrame: access lost (mode change / secure desktop / session switch)\n");
@@ -482,9 +524,19 @@ FrameStatus CaptureEngine::AcquireNextFrame(UINT timeoutMs, CapturedFrame& out)
     // From here a frame is held and MUST be released exactly once on every path.
     FrameStatus status = FrameStatus::Ok;
 
+    // The pointer is not part of the duplicated image: sample it ourselves on every call.
+    const bool pointerChanged = cfg_.drawCursor && cursor_.Poll(OutputDeviceName(), cfg_.width, cfg_.height);
+
     if (info.LastPresentTime.QuadPart == 0) {
-        // Pointer-only update: the desktop image didn't change.
-        status = FrameStatus::NoNewFrame;
+        // The desktop image didn't change. A moved/changed pointer still counts as a new frame.
+        if (pointerChanged) {
+            composeDirty_ = true;
+            out.texture    = padded_.Get();
+            out.frameIndex = ++frameIndex_;
+            out.pointerOnly = true;
+        } else {
+            status = FrameStatus::NoNewFrame;
+        }
     } else {
         ComPtr<ID3D11Texture2D> src;
         hr = resource.As(&src);
@@ -507,16 +559,17 @@ FrameStatus CaptureEngine::AcquireNextFrame(UINT timeoutMs, CapturedFrame& out)
                 D3D11_BOX box{};
                 box.left = 0;  box.top = 0;  box.front = 0;
                 box.right = cfg_.width;  box.bottom = cfg_.height;  box.back = 1;
-                ctx_->CopySubresourceRegion(padded_.Get(), 0, 0, 0, 0, src.Get(), 0, &box);
+                ctx_->CopySubresourceRegion(desktop_.Get(), 0, 0, 0, 0, src.Get(), 0, &box);
 
                 if (cfg_.replicateLastRow && paddedH_ > cfg_.height) {
                     D3D11_BOX last{};
                     last.left = 0;  last.right = cfg_.width;
                     last.top = cfg_.height - 1;  last.bottom = cfg_.height;
                     last.front = 0;  last.back = 1;
-                    ctx_->CopySubresourceRegion(padded_.Get(), 0, 0, cfg_.height, 0, src.Get(), 0, &last);
+                    ctx_->CopySubresourceRegion(desktop_.Get(), 0, 0, cfg_.height, 0, src.Get(), 0, &last);
                 }
 
+                composeDirty_         = true;
                 out.texture           = padded_.Get();
                 out.frameIndex        = ++frameIndex_;
                 out.presentTime       = info.LastPresentTime;

@@ -142,6 +142,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="CaptureEngine.cpp" />
+    <ClCompile Include="CursorOverlay.cpp" />
     <ClCompile Include="HardwareEncoder.cpp" />
     <ClCompile Include="InputInjector.cpp" />
     <ClCompile Include="main.cpp" />
@@ -150,6 +151,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CaptureEngine.h" />
+    <ClInclude Include="CursorOverlay.h" />
     <ClInclude Include="HardwareEncoder.h" />
     <ClInclude Include="InputInjector.h" />
     <ClInclude Include="Transport.h" />

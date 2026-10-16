@@ -33,6 +33,9 @@
     <ClCompile Include="UsbmuxdClient.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="CursorOverlay.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CaptureEngine.h">
@@ -48,6 +51,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="UsbmuxdClient.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="CursorOverlay.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

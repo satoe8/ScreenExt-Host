@@ -68,6 +68,21 @@ HRESULT SetCodecBool(ICodecAPI* api, const GUID& key, bool value)
     return api->SetValue(&key, &v);
 }
 
+// Read a codec property back from the MFT. Returns false if the property can't be read.
+bool ReadCodecValue(ICodecAPI* api, const GUID& key, ULONG& out)
+{
+    VARIANT v;
+    VariantInit(&v);
+    bool ok = false;
+    if (SUCCEEDED(api->GetValue(&key, &v))) {
+        if (v.vt == VT_BOOL)                         { out = (v.boolVal != VARIANT_FALSE) ? 1 : 0; ok = true; }
+        else if (v.vt == VT_UI4 || v.vt == VT_I4)    { out = v.ulVal; ok = true; }
+        else if (v.vt == VT_UI8 || v.vt == VT_I8)    { out = (ULONG)v.ullVal; ok = true; }
+    }
+    VariantClear(&v);
+    return ok;
+}
+
 void LogCodec(const wchar_t* name, HRESULT hr)
 {
     if (FAILED(hr))
@@ -182,6 +197,9 @@ bool HardwareEncoder::CreateMft(LUID luid)
                 friendly = name;
                 CoTaskMemFree(name);
             }
+            // IMFActivate is an IMFAttributes: ask for low latency at activation time too (it is also set on the
+            // MFT's own attributes in TryStart, and via CODECAPI_AVLowLatencyMode).
+            activates[i]->SetUINT32(MF_LOW_LATENCY, TRUE);
             ComPtr<IMFTransform> mft;
             const HRESULT ahr = activates[i]->ActivateObject(IID_PPV_ARGS(&mft));
             Logf(L"[enc] MFT candidate %u/%u: \"%ls\" activate=0x%08X\n", i + 1, count, friendly.c_str(), (unsigned)ahr);
@@ -225,10 +243,12 @@ bool HardwareEncoder::ConfigureCodecApi()
         LogCodec(L"AVEncCommonBufferSize", SetCodecU32(c, CODECAPI_AVEncCommonBufferSize, bytes));
     }
 
-    HRESULT hr = SetCodecU32(c, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_LowDelayVBR);
+    // CBR first: constant, predictable per-frame work and bit budget. (Intel's MFT already refused LowDelayVBR in
+    // earlier logs, so CBR is what it has been running; LowDelayVBR stays only as a fallback.)
+    HRESULT hr = SetCodecU32(c, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
     if (FAILED(hr)) {
-        Logf(L"[enc]   LowDelayVBR not accepted (0x%08X); trying CBR\n", (unsigned)hr);
-        LogCodec(L"RateControlMode(CBR)", SetCodecU32(c, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR));
+        Logf(L"[enc]   CBR not accepted (0x%08X); trying LowDelayVBR\n", (unsigned)hr);
+        LogCodec(L"RateControlMode(LowDelayVBR)", SetCodecU32(c, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_LowDelayVBR));
     }
     LogCodec(L"AVEncCommonMeanBitRate",  SetCodecU32(c, CODECAPI_AVEncCommonMeanBitRate, cfg_.bitrateKbps * 1000u));
     return true;
@@ -262,6 +282,29 @@ static HRESULT MakeVideoType(const GUID& subtype, UINT w, UINT h, UINT fps, bool
     }
     *out = t.Detach();
     return S_OK;
+}
+
+void HardwareEncoder::LogEffectiveSettings()
+{
+    if (!codec_) { Logf(L"[enc] (no ICodecAPI: cannot read back settings)\n"); return; }
+    struct Item { const wchar_t* name; const GUID* key; };
+    const Item items[] = {
+        { L"LowLatencyMode",  &CODECAPI_AVLowLatencyMode },
+        { L"RateControlMode", &CODECAPI_AVEncCommonRateControlMode },
+        { L"QualityVsSpeed",  &CODECAPI_AVEncCommonQualityVsSpeed },
+        { L"MeanBitRate",     &CODECAPI_AVEncCommonMeanBitRate },
+        { L"GOPSize",         &CODECAPI_AVEncMPVGOPSize },
+        { L"BufferSize",      &CODECAPI_AVEncCommonBufferSize },
+    };
+    // IsSupported: S_OK = the MFT implements the property, S_FALSE = it doesn't (a Set can still "succeed").
+    for (const Item& it : items) {
+        const HRESULT sup = codec_->IsSupported(it.key);
+        ULONG v = 0;
+        if (ReadCodecValue(codec_.Get(), *it.key, v))
+            Logf(L"[enc]   effective %-16ls = %lu  (supported=%ls)\n", it.name, v, sup == S_OK ? L"yes" : L"NO");
+        else
+            Logf(L"[enc]   effective %-16ls = <unreadable>  (supported=%ls)\n", it.name, sup == S_OK ? L"yes" : L"NO");
+    }
 }
 
 bool HardwareEncoder::ConfigureTypes(UINT w, UINT h)
@@ -477,6 +520,7 @@ bool HardwareEncoder::TryStart(UINT encW, UINT encH)
     if (!ConfigureTypes(encW, encH))
         return false;
     encW_ = encW; encH_ = encH;
+    LogEffectiveSettings();
 
     if (!CreateVideoProcessor(encW, encH)) return false;
     if (!CreateAllocator()) return false;

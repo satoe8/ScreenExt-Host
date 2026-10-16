@@ -9,7 +9,9 @@
 //   --console        attach to the launching console and log there (debugging)
 //   --hint <text> | --width W --height H     which output to capture (default: hint DELD0E6, auto size)
 //   --listen <port> | --connect host:port | --udp <port> | --usb | --no-usb | --no-net
-//   --fps N  --idle-fps N (floor rate when the desktop is static, default 30, 0 = same as --fps)  --bitrate <Mbps>  --gop N  --vbv-ms N  --min-qp N  --max-qp N  --no-cfr  --no-touch
+//   --no-cursor      don't draw the mouse pointer into the video
+//   --quality-speed N  encoder speed/quality trade-off, 0 = fastest (default) .. 100 = best quality
+//   --fps N  --idle-fps N (floor rate when the desktop is static, default 30, 0 = same as --fps)  --bitrate <Mbps> (default 10)  --gop N  --vbv-ms N  --min-qp N  --max-qp N  --no-cfr  --no-touch
 //   --out <file>     also record the H.264 stream;  --seconds N  stop after N seconds (test runs)
 //
 // Logs: %LOCALAPPDATA%\ScreenExt\HostService.log.   Must run in the interactive user session.
@@ -20,6 +22,7 @@
 #include "HardwareEncoder.h"
 
 #include <shellapi.h>
+#include <timeapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -170,6 +173,30 @@ static double Percentile(std::vector<double>& sorted, double p)
 
 // ---------------------------------------------------------------------------------------------
 
+// Keep Windows from throttling the host when the laptop runs on battery.
+static void ConfigureProcessForStreaming()
+{
+    if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
+        Logf(L"[main] SetPriorityClass(HIGH) failed: %lu\n", GetLastError());
+
+    // A priority class alone does not stop Windows' "power throttling" (EcoQoS): a windowless tray app is a prime
+    // candidate for it. Explicitly opt out (StateMask 0 = throttling OFF for every flag in ControlMask). Also make
+    // Windows honour our timer-resolution request even though our only window is hidden - on Windows 11 such
+    // requests are otherwise ignored for "invisible" processes, which would coarsen every Sleep()/wait below.
+    PROCESS_POWER_THROTTLING_STATE pt{};
+    pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+#ifdef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+    pt.ControlMask |= PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+#endif
+    pt.StateMask = 0;
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt)))
+        Logf(L"[main] Could not disable power throttling (%lu); continuing\n", GetLastError());
+
+    timeBeginPeriod(1);
+    Logf(L"[main] Process set to HIGH priority, power throttling disabled, 1 ms timer resolution\n");
+}
+
 // Log to %LOCALAPPDATA%\ScreenExt\HostService.log (and to the console when --console is used).
 static void SetupLogging(bool alsoConsole)
 {
@@ -237,6 +264,8 @@ static int HostMain(int argc, wchar_t** argv)
         else if (!wcscmp(argv[i], L"--no-usb"))                  netCfg.enableUsb = false;
         else if (!wcscmp(argv[i], L"--no-net"))                  useNet = false;
         else if (!wcscmp(argv[i], L"--discovery-port") && i + 1 < argc) netCfg.discoveryPort = (uint16_t)_wtoi(argv[++i]);
+        else if (!wcscmp(argv[i], L"--quality-speed") && i + 1 < argc) encCfg.qualityVsSpeed = (UINT)_wtoi(argv[++i]);
+        else if (!wcscmp(argv[i], L"--no-cursor"))               capCfg.drawCursor = false;
         else if (!wcscmp(argv[i], L"--idle-fps") && i + 1 < argc) idleFps = (UINT)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--no-cfr"))                  cfr = false;
         else if (!wcscmp(argv[i], L"--no-touch"))                noTouch = true;   // log touches only
@@ -332,7 +361,7 @@ static int HostMain(int argc, wchar_t** argv)
     // cheap, and the credit check below means they can never pile up behind a slow encoder.
     const UINT    idleRate = std::max<UINT>(1, std::min<UINT>(idleFps ? idleFps : encCfg.fps, encCfg.fps));
     const double idleInterval = 1.0 / idleRate;
-    const UINT acquireTimeoutMs = cfr ? 4 : 100;
+    const UINT acquireTimeoutMs = (cfr || capCfg.drawCursor) ? 4 : 100;   // short wait = pointer sampled ~250x/s
 
     const double start = QpcNow();
     double lastReport = start, lastSubmit = 0;
@@ -351,7 +380,8 @@ static int HostMain(int argc, wchar_t** argv)
 
         switch (st) {
         case FrameStatus::Ok:
-            ++captured; ++winCaptured; haveFrame = true; dirty = true;
+            if (!frame.pointerOnly) { ++captured; ++winCaptured; }   // pointer-only frames are counted separately
+            haveFrame = true; dirty = true;
             if (!cfr) submitNow = true;
             break;
 
@@ -416,7 +446,7 @@ static int HostMain(int argc, wchar_t** argv)
 
         // With a network target and nobody connected, don't burn GPU encoding into the void.
         if (submitNow && !g_stop && (!useNet || transport.IsClientConnected() || sink.file)) {
-            const SubmitResult r = encoder.Submit(engine.PaddedTexture());
+            const SubmitResult r = encoder.Submit(engine.FrameForEncode());
             lastSubmit = QpcNow();
             dirty = false;
             if (isRepeat) ++repeats;
@@ -519,6 +549,7 @@ static int HostMain(int argc, wchar_t** argv)
 // =============================================================================================
 
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 
@@ -704,6 +735,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         freopen_s(&f, "CONOUT$", "w", stderr);
     }
     SetupLogging(console);
+    ConfigureProcessForStreaming();
 
     // One host per user session (autostart + a manual launch must not fight over the monitor and ports).
     HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\ScreenExtHostService");
@@ -754,5 +786,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         ExitProcess(0);
     }
     worker.join();
+    timeEndPeriod(1);
     return 0;
 }

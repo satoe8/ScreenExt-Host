@@ -12,6 +12,8 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include "CursorOverlay.h"
+
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -43,6 +45,9 @@ struct CaptureConfig {
     // true : the last real row is copied into the extra row (avoids a black line / chroma
     //        bleed on the bottom edge of the encoded frame).
     bool replicateLastRow = false;
+
+    // Draw the Windows mouse pointer into the video (Desktop Duplication frames don't contain it).
+    bool drawCursor = true;
 };
 
 enum class FrameStatus {
@@ -61,6 +66,7 @@ struct CapturedFrame {
     uint64_t         frameIndex = 0;      // counts frames with FrameStatus::Ok
     LARGE_INTEGER    presentTime{};       // DXGI_OUTDUPL_FRAME_INFO::LastPresentTime (QPC)
     UINT             accumulatedFrames = 0;
+    bool             pointerOnly = false; // true: only the mouse pointer moved/changed, the desktop image is unchanged
 };
 
 class CaptureEngine {
@@ -85,7 +91,11 @@ public:
 
     ID3D11Device*        Device()  const { return device_.Get(); }
     ID3D11DeviceContext* Context() const { return ctx_.Get(); }
-    ID3D11Texture2D*     PaddedTexture() const { return padded_.Get(); }
+    ID3D11Texture2D*     PaddedTexture() const { return padded_.Get(); }   // may lack the latest pointer position
+
+    // The texture to hand to the encoder: the desktop with the mouse pointer drawn on top. Composes lazily (only if
+    // the desktop or pointer changed since the last call), so a 1000 Hz mouse costs one composition per encoded frame.
+    ID3D11Texture2D*     FrameForEncode();
     LUID                 AdapterLuid() const { return adapterLuid_; }
 
     // GDI name of the duplicated output (e.g. L"\\\\.\\DISPLAY4"); thread-safe, updated by Recover().
@@ -112,13 +122,19 @@ private:
     bool CreateDevice(IDXGIAdapter1* adapter);
     bool CreatePaddedTexture();
     bool CreateDuplication();
+    bool PollPointerOnly(CapturedFrame& out);
     void ApplyGeometry(UINT w, UINT h);
 
     CaptureConfig cfg_{};
 
     Microsoft::WRL::ComPtr<ID3D11Device>           device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext>    ctx_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D>        padded_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>        desktop_;   // clean copy of the duplicated desktop
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>        padded_;    // desktop_ + mouse pointer: what the encoder reads
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> paddedRtv_;
+    Microsoft::WRL::ComPtr<ID3D11Multithread>      mt_;
+    CursorOverlay                                  cursor_;
+    bool                                           composeDirty_ = true;
     Microsoft::WRL::ComPtr<IDXGIOutput1>           output_;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> dupl_;
 

@@ -40,14 +40,14 @@ struct EncoderConfig {
     UINT width  = 2556;       // size of the BGRA texture handed to Submit() (the padded one)
     UINT height = 1180;
     UINT fps    = 60;
-    UINT bitrateKbps = 20000;
+    UINT bitrateKbps = 10000;   // default 10 Mbit/s; override with --bitrate <Mbps> (e.g. --bitrate 5)
     UINT gopSize     = 36000; // 0 would mean "encoder decides", so use a very long GOP (10 min @60);
                               // IDRs then come only from RequestKeyFrame() (client connect / loss).
     UINT vbvMs       = 66;    // HRD buffer in ms of bitrate (H.264: CODECAPI_AVEncCommonBufferSize is in BYTES).
                               // Smaller = smaller IDRs but softer first frame. 0 = leave to encoder.
     UINT minQp       = 0;     // 0 = unset. Raising it (e.g. 24) caps IDR quality/size (AVEncVideoMinQP).
     UINT maxQp       = 0;     // 0 = unset (AVEncVideoMaxQP).
-    UINT qualityVsSpeed = 50; // CODECAPI_AVEncCommonQualityVsSpeed, 0 (fastest) .. 100 (best)
+    UINT qualityVsSpeed = 0;  // CODECAPI_AVEncCommonQualityVsSpeed: 0 = fastest/lowest latency .. 100 = best quality (--quality-speed N)
     UINT inputWaitMs = 20;    // how long Submit() waits for the MFT to ask for input before dropping
     UINT poolInitial = 4;     // NV12 sample pool (initial/max) owned by the MFT's allocator
     UINT poolMax     = 8;
@@ -123,6 +123,7 @@ private:
     bool TryStart(UINT encW, UINT encH);
     bool CreateMft(LUID luid);
     bool ConfigureCodecApi();
+    void LogEffectiveSettings();   // reads back what the MFT actually accepted
     bool ConfigureTypes(UINT encW, UINT encH);
     bool CreateVideoProcessor(UINT encW, UINT encH);
     bool CreateAllocator();
