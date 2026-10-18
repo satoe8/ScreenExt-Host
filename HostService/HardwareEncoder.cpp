@@ -204,9 +204,19 @@ bool HardwareEncoder::CreateMft(LUID luid)
             const HRESULT ahr = activates[i]->ActivateObject(IID_PPV_ARGS(&mft));
             Logf(L"[enc] MFT candidate %u/%u: \"%ls\" activate=0x%08X\n", i + 1, count, friendly.c_str(), (unsigned)ahr);
             if (SUCCEEDED(ahr)) {
-                mft_ = mft;
-                mftName_ = friendly;
-                ok = true;
+                // The MFT must be able to use OUR device. On hybrid laptops a hardware encoder that lives on the
+                // other GPU refuses it - skip such candidates instead of failing later.
+                ComPtr<IMFAttributes> ma;
+                if (SUCCEEDED(mft->GetAttributes(&ma)) && ma)
+                    ma->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+                const HRESULT dhr = mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(devMgr_.Get()));
+                if (FAILED(dhr)) {
+                    Logf(L"[enc]   -> rejected: cannot share the capture GPU's D3D11 device (0x%08X) - it is on a different adapter\n", (unsigned)dhr);
+                } else {
+                    mft_ = mft;
+                    mftName_ = friendly;
+                    ok = true;
+                }
             }
         }
         if (activates[i]) activates[i]->Release();
@@ -441,6 +451,17 @@ bool HardwareEncoder::Initialize(ID3D11Device* device, LUID adapterLuid, const E
     device_ = device;
     device_->GetImmediateContext(&ctx_);
 
+    // Hardware-agnostic adapter locking: capture, colour conversion and the encoder all use THIS device, so frames
+    // never cross a PCIe bus between GPUs. Say which adapter that is.
+    {
+        ComPtr<IDXGIDevice> dxgiDev;
+        ComPtr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC ad{};
+        if (SUCCEEDED(device_.As(&dxgiDev)) && SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&ad)))
+            Logf(L"[enc] Encoding on adapter \"%ls\" (LUID %08lX:%08lX): same D3D11 device as the desktop capture\n",
+                 ad.Description, (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart);
+    }
+
     if (cfg_.width & 1 || cfg_.height & 1) {
         Logf(L"[enc] Input size must be even (got %ux%u)\n", cfg_.width, cfg_.height);
         return false;
@@ -523,6 +544,7 @@ bool HardwareEncoder::TryStart(UINT encW, UINT encH)
     LogEffectiveSettings();
 
     if (!CreateVideoProcessor(encW, encH)) return false;
+    CreateGpuTimers();
     if (!CreateAllocator()) return false;
 
     // Event pump
@@ -575,6 +597,7 @@ void HardwareEncoder::TearDown()
         inflight_.clear();
     }
 
+    for (auto& g : gpuTimers_) g = GpuTimer{};
     outViews_.clear();
     inView_.Reset(); inViewTex_ = nullptr;
     vproc_.Reset(); venum_.Reset(); vctx_.Reset(); vdev_.Reset();
@@ -656,7 +679,20 @@ bool HardwareEncoder::ConvertInto(ID3D11Texture2D* src, IMFSample* dstSample)
     D3D11_VIDEO_PROCESSOR_STREAM st{};
     st.Enable = TRUE;
     st.pInputSurface = inView_.Get();
+    // Telemetry: how long does the GPU take to finish the conversion (event query = completion, timestamps = busy time)?
+    HarvestGpuTimers();
+    GpuTimer* gt = nullptr;
+    for (auto& g : gpuTimers_) if (g.disjoint && !g.pending) { gt = &g; break; }
+    if (gt) { ctx_->Begin(gt->disjoint.Get()); ctx_->End(gt->start.Get()); gt->issueQpc = Qpc(); }
+
     HRESULT hr = vctx_->VideoProcessorBlt(vproc_.Get(), it->second.Get(), 0, 1, &st);
+
+    if (gt) {
+        ctx_->End(gt->end.Get());
+        ctx_->End(gt->disjoint.Get());
+        ctx_->End(gt->done.Get());
+        gt->pending = true;
+    }
     if (FAILED(hr)) { Logf(L"[enc] VideoProcessorBlt failed: 0x%08X\n", (unsigned)hr); return false; }
 
     ctx_->Flush();   // make the conversion visible to the MFT's queue promptly
@@ -673,8 +709,64 @@ void HardwareEncoder::RequestKeyFrame(bool force)
     forceKey_ = true;
 }
 
+void HardwareEncoder::CreateGpuTimers()
+{
+    for (auto& g : gpuTimers_) {
+        g = GpuTimer{};
+        D3D11_QUERY_DESC q{};
+        q.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        const bool a = SUCCEEDED(device_->CreateQuery(&q, &g.disjoint));
+        q.Query = D3D11_QUERY_TIMESTAMP;
+        const bool b = SUCCEEDED(device_->CreateQuery(&q, &g.start)) && SUCCEEDED(device_->CreateQuery(&q, &g.end));
+        q.Query = D3D11_QUERY_EVENT;
+        const bool d = SUCCEEDED(device_->CreateQuery(&q, &g.done));
+        if (!(a && b && d)) g = GpuTimer{};          // telemetry is optional
+    }
+}
+
+// Non-blocking: collects finished conversions. Called from the capture thread (every few ms via HasInputCredit).
+void HardwareEncoder::HarvestGpuTimers()
+{
+    if (!ctx_) return;
+    for (auto& g : gpuTimers_) {
+        if (!g.pending) continue;
+        BOOL done = FALSE;
+        if (ctx_->GetData(g.done.Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || !done)
+            continue;
+
+        const double latMs = QpcToMs(Qpc() - g.issueQpc);
+        double busyMs = -1;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        UINT64 t0 = 0, t1 = 0;
+        if (ctx_->GetData(g.disjoint.Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK && !dj.Disjoint &&
+            dj.Frequency != 0 &&
+            ctx_->GetData(g.start.Get(), &t0, sizeof(t0), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            ctx_->GetData(g.end.Get(), &t1, sizeof(t1), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK && t1 >= t0)
+            busyMs = (double)(t1 - t0) * 1000.0 / (double)dj.Frequency;
+        g.pending = false;
+
+        std::lock_guard<std::mutex> lk(convMutex_);
+        convLatSum_ += latMs;
+        ++convCount_;
+        if (busyMs >= 0) { convBusySum_ += busyMs; ++convBusyCount_; }
+    }
+}
+
+HardwareEncoder::ConvertStats HardwareEncoder::TakeConvertStats()
+{
+    std::lock_guard<std::mutex> lk(convMutex_);
+    ConvertStats s;
+    s.samples = convCount_;
+    s.gpuLatencyMs = convCount_ ? convLatSum_ / convCount_ : 0;
+    s.gpuBusyMs = convBusyCount_ ? convBusySum_ / convBusyCount_ : -1;
+    convLatSum_ = convBusySum_ = 0;
+    convCount_ = convBusyCount_ = 0;
+    return s;
+}
+
 bool HardwareEncoder::HasInputCredit()
 {
+    HarvestGpuTimers();
     std::lock_guard<std::mutex> lk(inMutex_);
     return running_ && !draining_ && needInput_ > 0;
 }

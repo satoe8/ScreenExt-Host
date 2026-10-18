@@ -117,6 +117,13 @@ public:
     uint64_t DroppedPoolEmpty() const { return droppedPool_; }
     uint64_t Produced() const { return produced_; }
 
+    // Colour-conversion telemetry (BGRA -> NV12 on the D3D11 video processor, incl. the pointer composition queued
+    // before it). Averages since the previous call; samples == 0 means nothing finished in that window.
+    //   gpuLatencyMs: from issuing the conversion until the GPU reports it complete (upper bound, ~4 ms resolution)
+    //   gpuBusyMs   : GPU timestamp delta around the conversion (-1 if the driver gave no usable timestamps)
+    struct ConvertStats { double gpuLatencyMs = 0, gpuBusyMs = -1; unsigned samples = 0; };
+    ConvertStats TakeConvertStats();
+
 private:
     friend class EventCallback;
 
@@ -124,6 +131,8 @@ private:
     bool CreateMft(LUID luid);
     bool ConfigureCodecApi();
     void LogEffectiveSettings();   // reads back what the MFT actually accepted
+    void CreateGpuTimers();
+    void HarvestGpuTimers();
     bool ConfigureTypes(UINT encW, UINT encH);
     bool CreateVideoProcessor(UINT encW, UINT encH);
     bool CreateAllocator();
@@ -163,6 +172,16 @@ private:
     Microsoft::WRL::ComPtr<IMFAsyncCallback>         callback_;
     EventCallback*                                   callbackRaw_ = nullptr;
     DWORD inId_ = 0, outId_ = 0;
+
+    struct GpuTimer {
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint, start, end, done;
+        int64_t issueQpc = 0;
+        bool    pending = false;
+    };
+    GpuTimer   gpuTimers_[6];
+    std::mutex convMutex_;
+    double     convLatSum_ = 0, convBusySum_ = 0;
+    unsigned   convCount_ = 0, convBusyCount_ = 0;
 
     std::mutex mftMutex_;           // serializes ProcessInput / ProcessOutput / ProcessMessage
 

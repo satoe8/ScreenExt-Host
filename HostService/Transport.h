@@ -30,6 +30,10 @@
 //     u8 pointerId, u8 phase (0 down, 1 move, 2 up, 3 cancel),
 //     u16 x, u16 y   position in the crop rectangle, 0..65535 (0,0 = top-left of the visible area)
 //     u16 pressure   0..65535
+//   MSG_PEN (client -> host): PenPayload (14 bytes) - Apple Pencil, injected as a real Windows pen
+//     u8 phase (0 down, 1 move, 2 up, 3 cancel), u8 flags (bit0 barrel button, bit1 eraser),
+//     u16 x, u16 y (0..65535 in the visible area), u16 pressure (0..65535),
+//     i16 tiltX, i16 tiltY (degrees, -90..90), u16 rotation (degrees 0..359)
 //   MSG_PING (client -> host): u64 clientTimeUs      -> host answers MSG_PONG:
 //   MSG_PONG (host -> client): u64 clientTimeUs (echo), u64 hostTimeUs
 //
@@ -78,7 +82,7 @@ constexpr uint32_t kMagic   = 0x53444449u;
 constexpr uint8_t  kVersion = 1;
 
 enum MsgType : uint8_t {
-    MSG_VIDEO = 1, MSG_HELLO = 2, MSG_KEYFRAME_REQ = 3, MSG_TOUCH = 4, MSG_PING = 5, MSG_PONG = 6
+    MSG_VIDEO = 1, MSG_HELLO = 2, MSG_KEYFRAME_REQ = 3, MSG_TOUCH = 4, MSG_PING = 5, MSG_PONG = 6, MSG_PEN = 7
 };
 
 enum VideoFlags : uint16_t {
@@ -93,10 +97,11 @@ struct MsgHeader   { uint32_t magic; uint8_t version; uint8_t type; uint16_t fla
 struct VideoHeader { uint32_t frameNumber; uint64_t ptsUs; uint16_t cropX, cropY, cropW, cropH; };
 struct HelloPayload{ uint16_t codec, codedW, codedH, cropX, cropY, cropW, cropH, fps; };
 struct TouchPayload{ uint8_t pointerId; uint8_t phase; uint16_t x, y, pressure; };
+struct PenPayload  { uint8_t phase; uint8_t flags; uint16_t x, y, pressure; int16_t tiltX, tiltY; uint16_t rotation; };
 struct UdpHeader   { uint16_t magic; uint8_t kind; uint8_t reserved; uint32_t seq; uint16_t fragIndex, fragCount; };
 #pragma pack(pop)
 static_assert(sizeof(MsgHeader) == 12 && sizeof(VideoHeader) == 20 && sizeof(HelloPayload) == 16 &&
-              sizeof(TouchPayload) == 8 && sizeof(UdpHeader) == 12, "wire struct size changed");
+              sizeof(TouchPayload) == 8 && sizeof(PenPayload) == 14 && sizeof(UdpHeader) == 12, "wire struct size changed");
 
 constexpr uint16_t kUdpMagic = 0x4455;
 constexpr uint16_t kDiscoveryPort = 5001;
@@ -129,17 +134,20 @@ struct TransportConfig {
 
 enum class TouchPhase : uint8_t { Down = 0, Move = 1, Up = 2, Cancel = 3 };
 struct TouchEvent { uint8_t pointerId; TouchPhase phase; float x, y; float pressure; };  // x,y,pressure in 0..1
+struct PenEvent   { TouchPhase phase; bool barrel; bool eraser; float x, y, pressure; int tiltX, tiltY, rotation; };
 
 struct TransportCallbacks {
     std::function<void()>                 onClientConnected;     // request a keyframe here
     std::function<void()>                 onClientDisconnected;
     std::function<void()>                 onKeyframeRequest;     // client PLI or host-side overload
     std::function<void(const TouchEvent&)> onTouch;
+    std::function<void(const PenEvent&)>   onPen;
 };
 
 struct TransportStats {
     uint64_t framesSent = 0, bytesSent = 0, framesDropped = 0, queueOverflows = 0;
     uint64_t keyframeRequests = 0, touchEvents = 0, datagramsSent = 0;
+    uint64_t penEvents = 0;
     uint64_t hostKeyRequests = 0;   // IDRs requested by the host itself after a queue overflow
 };
 

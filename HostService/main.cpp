@@ -9,6 +9,7 @@
 //   --console        attach to the launching console and log there (debugging)
 //   --hint <text> | --width W --height H     which output to capture (default: hint DELD0E6, auto size)
 //   --listen <port> | --connect host:port | --udp <port> | --usb | --no-usb | --no-net
+//   --tap-slop N     pixels of wobble ignored right after a finger/pen lands so taps register as clicks (default 8, 0 = off)
 //   --no-cursor      don't draw the mouse pointer into the video
 //   --quality-speed N  encoder speed/quality trade-off, 0 = fastest (default) .. 100 = best quality
 //   --fps N  --idle-fps N (floor rate when the desktop is static, default 30, 0 = same as --fps)  --bitrate <Mbps> (default 10)  --gop N  --vbv-ms N  --min-qp N  --max-qp N  --no-cfr  --no-touch
@@ -218,6 +219,7 @@ static int HostMain(int argc, wchar_t** argv)
     CaptureConfig capCfg;
     EncoderConfig encCfg;
     double seconds = 10.0;
+    UINT tapSlop = 8;    // px of finger/pen wobble ignored right after landing, so taps stay taps (0 = off)
     UINT idleFps = 30;   // floor frame rate while the desktop is static; 0 = same as --fps
     bool cfr = true;
     std::wstring outPath;
@@ -266,6 +268,7 @@ static int HostMain(int argc, wchar_t** argv)
         else if (!wcscmp(argv[i], L"--discovery-port") && i + 1 < argc) netCfg.discoveryPort = (uint16_t)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--quality-speed") && i + 1 < argc) encCfg.qualityVsSpeed = (UINT)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--no-cursor"))               capCfg.drawCursor = false;
+        else if (!wcscmp(argv[i], L"--tap-slop") && i + 1 < argc) tapSlop = (UINT)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--idle-fps") && i + 1 < argc) idleFps = (UINT)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--no-cfr"))                  cfr = false;
         else if (!wcscmp(argv[i], L"--no-touch"))                noTouch = true;   // log touches only
@@ -314,6 +317,7 @@ static int HostMain(int argc, wchar_t** argv)
     InputInjector injector;
     bool injectorOk = false;
     if (useNet && !noTouch) {
+        injector.SetTapSlop((int)tapSlop, 150);
         injectorOk = injector.Initialize([&engine](DesktopRect& r) {
             DEVMODEW dm{};
             dm.dmSize = sizeof(dm);
@@ -350,6 +354,12 @@ static int HostMain(int argc, wchar_t** argv)
                 Logf(L"[main] touch id=%u phase=%d x=%.3f y=%.3f p=%.2f\n",
                      t.pointerId, (int)t.phase, t.x, t.y, t.pressure);
             if (injectorOk) injector.OnTouch(t);
+        };
+        cbs.onPen = [&injector, &injectorOk](const PenEvent& p) {
+            static unsigned moves = 0;
+            if (p.phase != TouchPhase::Move || (++moves % 120) == 0)
+                Logf(L"[main] pen phase=%d x=%.3f y=%.3f p=%.2f tilt=(%d,%d)\n", (int)p.phase, p.x, p.y, p.pressure, p.tiltX, p.tiltY);
+            if (injectorOk) injector.OnPen(p);
         };
         if (!transport.Start(netCfg, cbs)) { Logf(L"Transport start failed.\n"); return 3; }
         sink.transport = &transport;
@@ -462,14 +472,16 @@ static int HostMain(int argc, wchar_t** argv)
         if (now - lastReport >= 1.0) {
             double avg, mx, encAvg; unsigned n;
             sink.TakeWindow(avg, mx, n, encAvg);
+            const HardwareEncoder::ConvertStats cs = encoder.TakeConvertStats();
             const uint64_t sub = encoder.Submitted(), drp = encoder.DroppedNoInput() + encoder.DroppedPoolEmpty();
             winSubmitted = sub - prevSubmitted; winDropped = drp - prevDropped;
             prevSubmitted = sub; prevDropped = drp;
             const bool quiet = headless && !transport.IsClientConnected();   // keep the daemon log small when idle
             if (!quiet)
-                Logf(L"[main] %.1fs: captured %llu, submitted %llu, dropped %llu, no-credit %llu, encoded %u | latency avg %.2f ms (encode-only %.2f) max %.2f ms\n",
+                Logf(L"[main] %.1fs: captured %llu, submitted %llu, dropped %llu, no-credit %llu, encoded %u | latency avg %.2f ms (encode-only %.2f) max %.2f ms | convert gpu %.2f ms (busy %.2f)\n",
                      now - start, (unsigned long long)winCaptured, (unsigned long long)winSubmitted,
-                     (unsigned long long)winDropped, (unsigned long long)winNoCredit, n, avg, encAvg, mx);
+                     (unsigned long long)winDropped, (unsigned long long)winNoCredit, n, avg, encAvg, mx,
+                     cs.gpuLatencyMs, cs.gpuBusyMs);
             winNoCredit = 0;
             if (useNet && !quiet) {
                 const TransportStats ts = transport.Stats();

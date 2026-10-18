@@ -461,6 +461,27 @@ void Transport::HandleMessage(const MsgHeader& h, const uint8_t* payload)
         }
         break;
 
+    case MSG_PEN:
+        if (h.payloadLen == sizeof(PenPayload)) {
+            PenPayload pp;
+            std::memcpy(&pp, payload, sizeof(pp));
+            { std::lock_guard<std::mutex> sl(statsMutex_); ++stats_.penEvents; }
+            if (cb_.onPen && pp.phase <= 3) {
+                PenEvent e;
+                e.phase    = (TouchPhase)pp.phase;
+                e.barrel   = (pp.flags & 1) != 0;
+                e.eraser   = (pp.flags & 2) != 0;
+                e.x        = pp.x / 65535.0f;
+                e.y        = pp.y / 65535.0f;
+                e.pressure = pp.pressure / 65535.0f;
+                e.tiltX    = std::max(-90, std::min(90, (int)pp.tiltX));
+                e.tiltY    = std::max(-90, std::min(90, (int)pp.tiltY));
+                e.rotation = (int)(pp.rotation % 360);
+                cb_.onPen(e);
+            }
+        }
+        break;
+
     case MSG_PING:
         if (h.payloadLen == 8) {
             uint64_t out[2];
