@@ -468,9 +468,9 @@ bool HardwareEncoder::Initialize(ID3D11Device* device, LUID adapterLuid, const E
     }
 
     // Both we and the MFT touch the immediate context from different threads.
-    ComPtr<ID3D11Multithread> mt;
-    if (SUCCEEDED(ctx_.As(&mt)))
-        mt->SetMultithreadProtected(TRUE);
+    mt_.Reset();
+    if (SUCCEEDED(ctx_.As(&mt_)))
+        mt_->SetMultithreadProtected(TRUE);
 
     HRESULT hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) { Logf(L"[enc] MFStartup failed: 0x%08X\n", (unsigned)hr); return false; }
@@ -545,6 +545,9 @@ bool HardwareEncoder::TryStart(UINT encW, UINT encH)
 
     if (!CreateVideoProcessor(encW, encH)) return false;
     CreateGpuTimers();
+
+    useShaderConvert_ = cfg_.shaderConvert && nv12_.Initialize(device_.Get(), ctx_.Get());
+    Logf(L"[enc] Colour conversion: %ls\n", useShaderConvert_ ? L"pixel shader (NV12 plane views)" : L"D3D11 video processor");
     if (!CreateAllocator()) return false;
 
     // Event pump
@@ -598,6 +601,8 @@ void HardwareEncoder::TearDown()
     }
 
     for (auto& g : gpuTimers_) g = GpuTimer{};
+    nv12_.Reset();
+    useShaderConvert_ = false;
     outViews_.clear();
     inView_.Reset(); inViewTex_ = nullptr;
     vproc_.Reset(); venum_.Reset(); vctx_.Reset(); vdev_.Reset();
@@ -640,6 +645,31 @@ bool HardwareEncoder::ConvertInto(ID3D11Texture2D* src, IMFSample* dstSample)
         DWORD len = 0;
         if (SUCCEEDED(buf2d->GetContiguousLength(&len)))
             buf->SetCurrentLength(len);
+    }
+
+    // Fast path: two pixel-shader passes (Y, CbCr) straight into the encoder's NV12 texture.
+    if (useShaderConvert_) {
+        HarvestGpuTimers();
+        GpuTimer* gt = nullptr;
+        for (auto& g : gpuTimers_) if (g.disjoint && !g.pending) { gt = &g; break; }
+        if (gt) { ctx_->Begin(gt->disjoint.Get()); ctx_->End(gt->start.Get()); gt->issueQpc = Qpc(); }
+
+        if (mt_) mt_->Enter();                       // atomic w.r.t. the MFT's use of the immediate context
+        const bool ok = nv12_.Convert(src, cfg_.width, cfg_.height, dst.Get(), slice);
+        if (mt_) mt_->Leave();
+
+        if (gt) {
+            ctx_->End(gt->end.Get());
+            ctx_->End(gt->disjoint.Get());
+            ctx_->End(gt->done.Get());
+            gt->pending = true;
+        }
+        if (ok) {
+            ctx_->Flush();
+            return true;
+        }
+        Logf(L"[enc] Shader colour conversion failed on this GPU/driver; switching to the D3D11 video processor\n");
+        useShaderConvert_ = false;                   // permanent for this encoder session
     }
 
     // Input view (cached per source texture).

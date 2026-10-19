@@ -9,10 +9,11 @@
 //   --console        attach to the launching console and log there (debugging)
 //   --hint <text> | --width W --height H     which output to capture (default: hint DELD0E6, auto size)
 //   --listen <port> | --connect host:port | --udp <port> | --usb | --no-usb | --no-net
+//   --vp-convert     use the D3D11 video processor for colour conversion instead of the (default) pixel shader
 //   --tap-slop N     pixels of wobble ignored right after a finger/pen lands so taps register as clicks (default 8, 0 = off)
 //   --no-cursor      don't draw the mouse pointer into the video
 //   --quality-speed N  encoder speed/quality trade-off, 0 = fastest (default) .. 100 = best quality
-//   --fps N  --idle-fps N (floor rate when the desktop is static, default 30, 0 = same as --fps)  --bitrate <Mbps> (default 10)  --gop N  --vbv-ms N  --min-qp N  --max-qp N  --no-cfr  --no-touch
+//   --fps N  --idle-fps N (rate while the desktop is static; default 0 = same as --fps)  --bitrate <Mbps> (default 10)  --gop N  --vbv-ms N  --min-qp N  --max-qp N  --no-cfr  --no-touch
 //   --out <file>     also record the H.264 stream;  --seconds N  stop after N seconds (test runs)
 //
 // Logs: %LOCALAPPDATA%\ScreenExt\HostService.log.   Must run in the interactive user session.
@@ -220,7 +221,7 @@ static int HostMain(int argc, wchar_t** argv)
     EncoderConfig encCfg;
     double seconds = 10.0;
     UINT tapSlop = 8;    // px of finger/pen wobble ignored right after landing, so taps stay taps (0 = off)
-    UINT idleFps = 30;   // floor frame rate while the desktop is static; 0 = same as --fps
+    UINT idleFps = 0;    // frame rate while the desktop is static: 0 = same as --fps (full rate, smooth cursor); lower saves power
     bool cfr = true;
     std::wstring outPath;
     TransportConfig netCfg;
@@ -268,6 +269,7 @@ static int HostMain(int argc, wchar_t** argv)
         else if (!wcscmp(argv[i], L"--discovery-port") && i + 1 < argc) netCfg.discoveryPort = (uint16_t)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--quality-speed") && i + 1 < argc) encCfg.qualityVsSpeed = (UINT)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--no-cursor"))               capCfg.drawCursor = false;
+        else if (!wcscmp(argv[i], L"--vp-convert"))              encCfg.shaderConvert = false;   // A/B: use the video processor
         else if (!wcscmp(argv[i], L"--tap-slop") && i + 1 < argc) tapSlop = (UINT)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--idle-fps") && i + 1 < argc) idleFps = (UINT)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--no-cfr"))                  cfr = false;

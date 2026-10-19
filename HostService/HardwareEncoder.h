@@ -23,6 +23,8 @@
 #include <mftransform.h>
 #include <wrl/client.h>
 
+#include "Nv12Converter.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -55,6 +57,10 @@ struct EncoderConfig {
     // If the MFT rejects the exact size (e.g. 2556x1180), retry with 16-aligned dimensions
     // (2560x1184). The picture is placed at the top-left; the client must crop either way.
     bool allowAlignedFallback = true;
+
+    // BGRA -> NV12 with two pixel-shader passes (fast) instead of the D3D11 video processor. Falls back to the
+    // video processor automatically if the GPU/driver can't render to NV12 planes. false = always use the processor.
+    bool shaderConvert = true;
 };
 
 struct EncodedFrame {
@@ -182,6 +188,10 @@ private:
     std::mutex convMutex_;
     double     convLatSum_ = 0, convBusySum_ = 0;
     unsigned   convCount_ = 0, convBusyCount_ = 0;
+
+    Nv12Converter nv12_;
+    bool          useShaderConvert_ = false;
+    Microsoft::WRL::ComPtr<ID3D11Multithread> mt_;
 
     std::mutex mftMutex_;           // serializes ProcessInput / ProcessOutput / ProcessMessage
 

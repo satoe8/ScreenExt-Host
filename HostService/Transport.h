@@ -21,8 +21,9 @@
 //                                      (2556x1179 inside 2556x1180 / 2560x1184)
 //
 //   MSG_HELLO (host -> client, first message after connect):
-//     u16 codec(1 = H.264 Annex-B), u16 codedW, u16 codedH,
-//     u16 cropX, u16 cropY, u16 cropW, u16 cropH, u16 fps
+//     u16 codec (1 = H.264 Annex-B), u16 codedW, u16 codedH, u16 cropX, u16 cropY, u16 cropW, u16 cropH,
+//     u16 fps, u16 transport (0 = Wi-Fi/LAN TCP, 1 = USB tunnel, 2 = UDP)
+//     (the transport field is absent - a 16-byte payload - in older hosts)
 //
 //   MSG_KEYFRAME_REQ (client -> host): empty payload. Send when a decoder error occurs or a
 //                                      UDP frame has missing fragments.
@@ -95,12 +96,12 @@ enum VideoFlags : uint16_t {
 #pragma pack(push, 1)
 struct MsgHeader   { uint32_t magic; uint8_t version; uint8_t type; uint16_t flags; uint32_t payloadLen; };
 struct VideoHeader { uint32_t frameNumber; uint64_t ptsUs; uint16_t cropX, cropY, cropW, cropH; };
-struct HelloPayload{ uint16_t codec, codedW, codedH, cropX, cropY, cropW, cropH, fps; };
+struct HelloPayload{ uint16_t codec, codedW, codedH, cropX, cropY, cropW, cropH, fps, transport; };
 struct TouchPayload{ uint8_t pointerId; uint8_t phase; uint16_t x, y, pressure; };
 struct PenPayload  { uint8_t phase; uint8_t flags; uint16_t x, y, pressure; int16_t tiltX, tiltY; uint16_t rotation; };
 struct UdpHeader   { uint16_t magic; uint8_t kind; uint8_t reserved; uint32_t seq; uint16_t fragIndex, fragCount; };
 #pragma pack(pop)
-static_assert(sizeof(MsgHeader) == 12 && sizeof(VideoHeader) == 20 && sizeof(HelloPayload) == 16 &&
+static_assert(sizeof(MsgHeader) == 12 && sizeof(VideoHeader) == 20 && sizeof(HelloPayload) == 18 &&
               sizeof(TouchPayload) == 8 && sizeof(PenPayload) == 14 && sizeof(UdpHeader) == 12, "wire struct size changed");
 
 constexpr uint16_t kUdpMagic = 0x4455;
@@ -209,7 +210,7 @@ private:
     std::atomic<ULONGLONG> lastPeerTickMs_{0};
 
     std::thread ioThread_, sendThread_, discoveryThread_, usbThread_;
-    std::mutex sessionMutex_;               // only one client session at a time
+    std::timed_mutex sessionMutex_;         // only one client session at a time
     std::atomic<bool> viaUsb_{false};
     std::atomic<SOCKET> discoverySock_{INVALID_SOCKET};
     std::atomic<ULONGLONG> lastOverflowKeyReqMs_{0};

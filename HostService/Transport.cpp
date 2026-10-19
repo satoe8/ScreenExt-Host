@@ -6,6 +6,7 @@
 #include <mstcpip.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <set>
 
@@ -225,7 +226,8 @@ Transport::Message Transport::BuildHello()
     HelloPayload hp;
     {
         std::lock_guard<std::mutex> lk(qMutex_);   // geometry may be updated while streaming
-        hp = { 1, cfg_.codedW, cfg_.codedH, cfg_.cropX, cfg_.cropY, cfg_.cropW, cfg_.cropH, cfg_.fps };
+        hp = { 1, cfg_.codedW, cfg_.codedH, cfg_.cropX, cfg_.cropY, cfg_.cropW, cfg_.cropH, cfg_.fps,
+               (uint16_t)(viaUsb_ ? 1 : (cfg_.mode == TransportMode::Udp ? 2 : 0)) };
     }
     return BuildSimple(MSG_HELLO, &hp, sizeof(hp));
 }
@@ -269,7 +271,7 @@ void Transport::OnConnected()
 
     Enqueue(BuildHello(), ctlSeq_++, false, true);
 
-    Logf(L"[net] Client connected\n");
+    Logf(L"[net] Client connected via %ls\n", viaUsb_ ? L"USB" : (cfg_.mode == TransportMode::Udp ? L"UDP" : L"Wi-Fi/LAN"));
     if (cb_.onClientConnected) cb_.onClientConnected();   // -> request an IDR
 }
 
@@ -547,8 +549,10 @@ void Transport::IoThreadTcp()
 // the usbmuxd tunnel. Returns when the client goes away. Only one session can be active at a time.
 void Transport::RunTcpSession(SOCKET c, bool viaUsb)
 {
-    std::unique_lock<std::mutex> session(sessionMutex_, std::try_to_lock);
-    if (!session.owns_lock()) {
+    std::unique_lock<std::timed_mutex> session(sessionMutex_, std::defer_lock);
+    const bool locked = viaUsb ? session.try_lock_for(std::chrono::seconds(3))   // a USB tunnel REPLACES a Wi-Fi session:
+                               : session.try_lock();                              // the app drops its Wi-Fi link when it arrives
+    if (!locked) {
         Logf(L"[net] Rejected a second client: a session is already active\n");
         closesocket(c);
         return;
@@ -596,7 +600,8 @@ void Transport::UsbThread()
     auto nap = [this](int ms) { for (int i = 0; i < ms / 50 && !stopping_; ++i) Sleep(50); };
 
     while (!stopping_) {
-        if (connected_) { nap(500); continue; }          // already streaming (Wi-Fi or USB)
+        if (connected_ && viaUsb_) { nap(500); continue; }   // already on USB: nothing to do
+        // Not connected, or connected over Wi-Fi: USB is preferred (lower latency), so keep looking for a device.
 
         std::vector<UsbDevice> devices;
         if (!UsbmuxdClient::ListDevices(devices)) {
@@ -615,7 +620,7 @@ void Transport::UsbThread()
 
         bool ranSession = false;
         for (const UsbDevice& d : devices) {
-            if (stopping_ || connected_) break;
+            if (stopping_ || (connected_ && viaUsb_)) break;
             int result = -1;
             SOCKET s = UsbmuxdClient::ConnectToDevice(d.deviceId, cfg_.usbDevicePort, &result);
             if (s == INVALID_SOCKET) {
@@ -626,7 +631,8 @@ void Transport::UsbThread()
                 }
                 continue;
             }
-            Logf(L"[net] USB: tunnel to device %hs established\n", d.serial.c_str());
+            Logf(L"[net] USB: tunnel to device %hs established%ls\n", d.serial.c_str(),
+                 connected_ ? L" - switching from Wi-Fi to USB" : L"");
             last = S_NONE;
             RunTcpSession(s, true);                       // blocks until the session ends
             ranSession = true;
