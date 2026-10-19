@@ -148,6 +148,7 @@
     <ClCompile Include="HardwareEncoder.cpp" />
     <ClCompile Include="InputInjector.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="Nv12Converter.cpp" />
     <ClCompile Include="Transport.cpp" />
     <ClCompile Include="UsbmuxdClient.cpp" />
   </ItemGroup>
@@ -156,6 +157,7 @@
     <ClInclude Include="CursorOverlay.h" />
     <ClInclude Include="HardwareEncoder.h" />
     <ClInclude Include="InputInjector.h" />
+    <ClInclude Include="Nv12Converter.h" />
     <ClInclude Include="Transport.h" />
     <ClInclude Include="UsbmuxdClient.h" />
   </ItemGroup>
